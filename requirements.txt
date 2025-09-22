@@ -1,0 +1,6 @@
+psycopg2-binary==2.9.9
+pandas==2.2.2
+numpy==2.1.1
+Faker==33.0.0
+python-dateutil==2.9.0.post0
+python-dotenv==1.0.1
