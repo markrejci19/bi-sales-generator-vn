@@ -38,6 +38,56 @@ PRODUCT_CATEGORIES = [
     ("Quần áo sơ sinh", ["Carters", "Gap", "H&M", "Ninomaxx"]),
 ]
 
+# Category-specific specs to ensure product names align with categories
+CATEGORY_SPECS = {
+    "Sữa bột": {
+        "base_names": ["Sữa bột công thức", "Sữa bột dinh dưỡng", "Sữa công thức"],
+        "sizes": ["400g", "800g", "1.2kg"],
+        "units": ["hộp", "lon"],
+        # Giá niêm yết tham khảo theo cỡ hộp
+        "price": (250_000, 1_200_000),
+    },
+    "Tã/bỉm": {
+        "base_names": ["Tã dán", "Tã quần"],
+        "sizes": ["NB", "S", "M", "L", "XL", "XXL"],
+        "units": ["bịch", "gói"],
+        "price": (120_000, 600_000),
+    },
+    "Đồ ăn dặm": {
+        "base_names": ["Bột ăn dặm", "Bánh ăn dặm", "Pouch ăn dặm"],
+        "sizes": ["120g", "200g", "250g"],
+        "units": ["hộp", "gói"],
+        "price": (25_000, 120_000),
+    },
+    "Bình sữa & núm ti": {
+        "base_names": ["Bình sữa", "Núm ti"],
+        "sizes": ["120ml", "160ml", "240ml"],
+        "units": ["cái", "bộ"],
+        "price": (60_000, 600_000),
+    },
+    "Xe đẩy & ghế ngồi": {
+        "base_names": ["Xe đẩy", "Ghế ngồi ô tô", "Ghế ăn dặm"],
+        "sizes": ["1 chiếc"],
+        "units": ["cái"],
+        "price": (800_000, 7_000_000),
+    },
+    "Đồ vệ sinh": {
+        "base_names": ["Sữa tắm gội", "Khăn ướt", "Bông tăm", "Nước giặt đồ em bé"],
+        "sizes": ["200ml", "500ml", "100 tờ"],
+        "units": ["chai", "gói"],
+        "price": (20_000, 250_000),
+    },
+    "Quần áo sơ sinh": {
+        "base_names": ["Bộ quần áo sơ sinh", "Bodysuit", "Bao tay chân"],
+        "sizes": ["S", "M", "L"],
+        "units": ["bộ"],
+        "price": (40_000, 300_000),
+    },
+}
+
+# Helper map for brands per category
+CATEGORY_BRANDS = {cat: brands for cat, brands in PRODUCT_CATEGORIES}
+
 UNITS = ["hộp", "bịch", "gói", "chai", "cái", "bộ"]
 
 EMP_ROLES = ["Nhân viên bán hàng", "Thu ngân", "Quản lý cửa hàng", "Tư vấn viên"]
@@ -55,6 +105,7 @@ class Config:
     min_rows: int = 1000
     max_rows: int = 5000
     export_csv_dir: Optional[str] = None
+    db_export_dir: Optional[str] = None  # export tables from DB to CSV with UTF-8 BOM
 
 @dataclass
 class DbConfig:
@@ -76,7 +127,8 @@ def load_config_from_env() -> Tuple[Config, DbConfig]:
         years=int(os.getenv('YEARS', 3)),
         min_rows=int(os.getenv('MIN_ROWS', 1000)),
         max_rows=int(os.getenv('MAX_ROWS', 5000)),
-        export_csv_dir=os.getenv('EXPORT_CSV_DIR')
+    export_csv_dir=os.getenv('EXPORT_CSV_DIR'),
+    db_export_dir=os.getenv('DB_EXPORT_DIR')
     )
     dbc = DbConfig(
         host=os.getenv('PG_HOST', 'localhost'),
@@ -119,7 +171,7 @@ def build_date_dim(years: int) -> pd.DataFrame:
     for i in range(days + 1):
         d = start + timedelta(days=i)
         rows.append({
-            'date_key': int(d.strftime('%Y%m%d')),
+            'date_id': int(d.strftime('%Y%m%d')),
             'full_date': d,
             'day': d.day,
             'week': int(d.strftime('%U')),
@@ -145,6 +197,16 @@ def build_customer_dim(n: int) -> pd.DataFrame:
         city, province = random.choice(VN_CITIES)
         gender = random.choice(["Nam", "Nữ"])
         birth = fake.date_of_birth(minimum_age=18, maximum_age=45)
+        # Loyalty points and tier
+        pts = random.randint(0, 20000)
+        if pts < 1000:
+            tier = 'Bronze'
+        elif pts < 5000:
+            tier = 'Silver'
+        elif pts < 15000:
+            tier = 'Gold'
+        else:
+            tier = 'Platinum'
         rows.append({
             'customer_id': f'CUST-{i+1:04d}',
             'ho_ten': fake.name(),
@@ -154,16 +216,18 @@ def build_customer_dim(n: int) -> pd.DataFrame:
             'email': fake.free_email(),
             'dia_chi': fake.street_address(),
             'thanh_pho': city,
-            'tinh_thanh': province
+            'tinh_thanh': province,
+            'point': pts,
+            'tier': tier
         })
     return pd.DataFrame(rows)
 
 
-def build_customer_users(cust_df: pd.DataFrame) -> pd.DataFrame:
-    """For each customer, create 0-5 product users (children) with gender and DOB."""
+def build_customer_children(cust_df: pd.DataFrame) -> pd.DataFrame:
+    """For each customer, create 0-5 product users (children) with name, gender and DOB."""
     rows = []
-    for idx, _ in cust_df.iterrows():
-        customer_key = int(idx) + 1  # matches SERIAL order of inserts
+    for _, row in cust_df.iterrows():
+        customer_id = row['customer_id']
         count = random.randint(0, 5)
         for _ in range(count):
             gender = random.choice(["Nam", "Nữ"])
@@ -173,7 +237,8 @@ def build_customer_users(cust_df: pd.DataFrame) -> pd.DataFrame:
             start = date.today() - relativedelta(years=years, days=random.randint(0, 364))
             dob = start
             rows.append({
-                'customer_key': customer_key,
+                'customer_id': customer_id,
+                'ho_ten': fake.first_name_male() if gender == 'Nam' else fake.first_name_female(),
                 'gioi_tinh': gender,
                 'ngay_sinh': dob
             })
@@ -181,22 +246,24 @@ def build_customer_users(cust_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_product_dim(n: int) -> pd.DataFrame:
+    """Generate products with names consistent to their category (danh_muc)."""
     rows = []
     pid = 1
+    # Distribute products across categories fairly
+    cats = list(CATEGORY_SPECS.keys())
     while len(rows) < n:
-        cat, brands = random.choice(PRODUCT_CATEGORIES)
-        brand = random.choice(brands)
-        unit = random.choice(UNITS)
-        # Construct Vietnamese product names for mother & baby
-        base_names = [
-            "Sữa bột", "Tã dán", "Tã quần", "Bột ăn dặm", "Bánh ăn dặm", "Bình sữa", "Núm ti",
-            "Xe đẩy", "Ghế ăn", "Ghế ngồi ô tô", "Sữa tắm gội", "Khăn ướt", "Bông tăm",
-            "Quần áo sơ sinh", "Bộ quần áo"
-        ]
-        name = random.choice(base_names)
-        size = random.choice(["400g", "800g", "1.2kg", "S", "M", "L", "XL", "XXL", "120ml", "240ml", "1 chiếc", "1 bộ"])
-        product_name = f"{name} {brand} {size}"
-        list_price = round(random.uniform(35000, 3500000), 0)
+        cat = random.choice(cats)
+        spec = CATEGORY_SPECS[cat]
+        brand = random.choice(CATEGORY_BRANDS[cat])
+        unit = random.choice(spec["units"]) if spec.get("units") else random.choice(UNITS)
+        base_name = random.choice(spec["base_names"]) if spec.get("base_names") else cat
+        size = random.choice(spec["sizes"]) if spec.get("sizes") else ""
+        min_p, max_p = spec.get("price", (35_000, 3_500_000))
+        # Chọn giá trong khoảng và làm tròn đến nghìn cho thực tế Việt Nam
+        raw_price = random.uniform(min_p, max_p)
+        list_price = int(round(raw_price / 1000.0) * 1000)
+        size_part = f" {size}" if size else ""
+        product_name = f"{base_name} {brand}{size_part}"
         rows.append({
             'product_id': f'PRD-{pid:04d}',
             'ten_san_pham': product_name,
@@ -209,6 +276,57 @@ def build_product_dim(n: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def refresh_products_only(dbc: DbConfig):
+    """Regenerate products attributes in place (update only) to keep FKs intact."""
+    with get_conn(dbc) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM products ORDER BY id")
+            ids = [r[0] for r in cur.fetchall()]
+        if not ids:
+            print("Không có sản phẩm nào để cập nhật.")
+            return
+        new_df = build_product_dim(len(ids))
+        # Preserve existing product_id order
+        new_df['product_id'] = ids
+        # Normalize numpy types
+        def pyify(x: Any) -> Any:
+            if pd.isna(x):
+                return None
+            if isinstance(x, (np.integer,)):
+                return int(x)
+            if isinstance(x, (np.floating,)):
+                return float(x)
+            if isinstance(x, (np.bool_,)):
+                return bool(x)
+            return x
+        updates = [
+            (
+                pyify(row.ten_san_pham),
+                pyify(row.danh_muc),
+                pyify(row.thuong_hieu),
+                pyify(row.don_vi),
+                pyify(row.gia_niem_yet),
+                pyify(row.product_id),
+            )
+            for row in new_df.itertuples(index=False)
+        ]
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                UPDATE products
+                SET ten_san_pham=%s,
+                    danh_muc=%s,
+                    thuong_hieu=%s,
+                    don_vi=%s,
+                    gia_niem_yet=%s
+                WHERE id=%s
+                """,
+                updates,
+            )
+        conn.commit()
+        print(f"Đã cập nhật lại {len(ids)} sản phẩm trong products (chỉ update).")
+
+
 def build_employee_dim(n: int, stores: List[str]) -> pd.DataFrame:
     rows = []
     for i in range(n):
@@ -216,7 +334,8 @@ def build_employee_dim(n: int, stores: List[str]) -> pd.DataFrame:
             'employee_id': f'EMP-{i+1:04d}',
             'ho_ten': fake.name(),
             'chuc_danh': random.choice(EMP_ROLES),
-            'cua_hang_mac_dinh': random.choice(stores)
+            # If no stores provided, leave default store empty
+            'cua_hang_mac_dinh': (random.choice(stores) if stores else None)
         })
     return pd.DataFrame(rows)
 
@@ -232,7 +351,8 @@ def build_store_dim(n: int) -> pd.DataFrame:
             'thanh_pho': city,
             'tinh_thanh': province
         })
-    return pd.DataFrame(rows)
+    # Ensure DataFrame always has expected columns even when n == 0
+    return pd.DataFrame(rows, columns=['store_id','ten_cua_hang','dia_chi','thanh_pho','tinh_thanh'])
 
 
 def build_promotion_dim(n: int, date_df: pd.DataFrame) -> pd.DataFrame:
@@ -263,28 +383,34 @@ def build_promotion_dim(n: int, date_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def weighted_price(base: float) -> float:
-    # Simulate price variability around list price
-    return round(base * random.uniform(0.85, 1.05), 0)
+    # Giá bán thực tế dao động nhẹ quanh giá niêm yết (ưu đãi nhẹ)
+    price = base * random.uniform(0.95, 1.02)
+    return int(round(price / 1000.0) * 1000)
 
 
-def apply_promotion(price: float, qty: int, promo_row: Optional[pd.Series]) -> Tuple[float, float]:
-    if promo_row is None:
-        return 0.0, price * qty
-    ptype = promo_row['loai']
-    value = float(promo_row['gia_tri'])
-    subtotal = price * qty
-    if ptype == 'Percent':
-        discount = subtotal * (value / 100.0)
-    elif ptype == 'Amount':
-        discount = min(value, subtotal * 0.6)  # cap to avoid negative
-    else:  # Bundle simple model: buy 3 pay 2 equivalent
-        free_units = qty // 3
-        discount = free_units * price
-    revenue = max(subtotal - discount, 0.0)
-    return round(discount, 0), round(revenue, 0)
+def compute_item_discounts(price: float, qty: int, promo_row: Optional[pd.Series]) -> Tuple[float, float]:
+    """Return (promo_per_unit, extra_discount_per_unit) ensuring promo+discount < price."""
+    promo_unit = 0.0
+    if promo_row is not None:
+        ptype = promo_row['loai']
+        value = float(promo_row['gia_tri'])
+        if ptype == 'Percent':
+            promo_unit = price * (value / 100.0)
+        elif ptype == 'Amount':
+            # Distribute amount per unit conservatively and cap at 60% price
+            promo_unit = min(max(value / max(1, qty), 0.0), price * 0.6)
+        else:  # Bundle: approximate per-unit benefit
+            free_units = qty // 3
+            promo_unit = (free_units * price) / max(qty, 1)
+    # Extra discount up to 10% of price
+    discount_unit = random.uniform(0, price * 0.1)
+    # Enforce promo + discount < price
+    promo_unit = min(promo_unit, price - 1)
+    discount_unit = min(discount_unit, max(0.0, price - 1 - promo_unit))
+    return round(promo_unit, 0), round(discount_unit, 0)
 
 
-def build_sales_fact(
+def build_orders(
     min_rows: int,
     max_rows: int,
     date_df: pd.DataFrame,
@@ -293,38 +419,53 @@ def build_sales_fact(
     emp_df: pd.DataFrame,
     store_df: pd.DataFrame,
     promo_df: pd.DataFrame
-) -> pd.DataFrame:
-    n = random.randint(min_rows, max_rows)
-    date_keys = date_df['date_key'].tolist()
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    n_orders = random.randint(min_rows, max_rows)
+    date_keys = date_df['date_id'].tolist()
     # index promotions by date for simple matching
-    promo_by_date = {}
+    promo_by_date: dict[int, list[pd.Series]] = {}
     for _, r in promo_df.iterrows():
         d = r['start_date']
         while d <= r['end_date']:
             promo_by_date.setdefault(int(d.strftime('%Y%m%d')), []).append(r)
             d += timedelta(days=1)
-    rows = []
-    for _ in range(n):
+    headers = []
+    items = []
+    for oid in range(1, n_orders + 1):
         dkey = random.choice(date_keys)
+        cust = cust_df.sample(1).iloc[0] if not cust_df.empty else None
+        emp = emp_df.sample(1).iloc[0] if not emp_df.empty else None
+        store = store_df.sample(1).iloc[0] if not store_df.empty else None
+        channel = 'Online' if random.random() < 0.35 else 'Offline'
+        headers.append({
+            'order_id': oid,
+            'date_id': dkey,
+            'customer_id': (cust['customer_id'] if cust is not None else None),
+            'employee_id': (emp['employee_id'] if emp is not None else None),
+            'store_id': (store['store_id'] if store is not None else None),
+            'channel': channel,
+        })
+        # Items 1-5 unique products
+        item_count = random.randint(1, 5)
+        prods = prod_df.sample(item_count, replace=False).itertuples(index=False)
         p_opts = promo_by_date.get(dkey, [])
         promo_row = random.choice(p_opts) if p_opts and random.random() < 0.35 else None
-        prod = prod_df.sample(1).iloc[0]
-        price = weighted_price(float(prod['gia_niem_yet']))
-        qty = random.choices([1,2,3,4,5,6], weights=[45,25,15,8,5,2])[0]
-        discount, revenue = apply_promotion(price, qty, promo_row)
-        rows.append({
-            'date_key': dkey,
-            'customer_key': int(cust_df.sample(1).index[0]) + 1 if not cust_df.empty else None,
-            'product_key': int(prod_df.index[prod_df['product_id'] == prod['product_id']][0]) + 1,
-            'employee_key': int(emp_df.sample(1).index[0]) + 1 if not emp_df.empty else None,
-            'store_key': int(store_df.sample(1).index[0]) + 1 if not store_df.empty else None,
-            'promotion_key': int(promo_df.index[promo_df['promotion_id'] == promo_row['promotion_id']][0]) + 1 if promo_row is not None else None,
-            'so_luong': qty,
-            'don_gia': price,
-            'chiet_khau': discount,
-            'doanh_thu': revenue
-        })
-    return pd.DataFrame(rows)
+        for prod in prods:
+            price = weighted_price(float(prod.gia_niem_yet))
+            qty = random.choices([1,2,3,4,5,6], weights=[45,25,15,8,5,2])[0]
+            km_unit, ck_unit = compute_item_discounts(price, qty, promo_row)
+            line_rev = max((price - km_unit - ck_unit) * qty, 0.0)
+            items.append({
+                'order_id': oid,
+                'product_id': prod.product_id,
+                'promotion_id': (promo_row['promotion_id'] if promo_row is not None else None),
+                'so_luong': qty,
+                'don_gia': price,
+                'khuyen_mai': km_unit,
+                'chiet_khau': ck_unit,
+                'doanh_thu': round(line_rev, 0)
+            })
+    return pd.DataFrame(headers), pd.DataFrame(items)
 
 
 def create_schema(conn):
@@ -335,15 +476,17 @@ def create_schema(conn):
 
 
 def truncate_tables(conn):
-    run_sql(conn, "TRUNCATE TABLE Sales_Fact RESTART IDENTITY CASCADE;")
-    run_sql(conn, "TRUNCATE TABLE KPI_Summary RESTART IDENTITY CASCADE;")
-    run_sql(conn, "TRUNCATE TABLE Promotion_Dim RESTART IDENTITY CASCADE;")
-    run_sql(conn, "TRUNCATE TABLE Store_Dim RESTART IDENTITY CASCADE;")
-    run_sql(conn, "TRUNCATE TABLE Employee_Dim RESTART IDENTITY CASCADE;")
-    run_sql(conn, "TRUNCATE TABLE Product_Dim RESTART IDENTITY CASCADE;")
-    run_sql(conn, "TRUNCATE TABLE Customer_User RESTART IDENTITY CASCADE;")
-    run_sql(conn, "TRUNCATE TABLE Customer_Dim RESTART IDENTITY CASCADE;")
-    run_sql(conn, "TRUNCATE TABLE Date_Dim RESTART IDENTITY CASCADE;")
+    # Truncate in FK-safe order
+    run_sql(conn, "TRUNCATE TABLE order_items RESTART IDENTITY CASCADE;")
+    run_sql(conn, "TRUNCATE TABLE orders RESTART IDENTITY CASCADE;")
+    run_sql(conn, "TRUNCATE TABLE KPI_Target_Monthly RESTART IDENTITY CASCADE;")
+    run_sql(conn, "TRUNCATE TABLE promotions RESTART IDENTITY CASCADE;")
+    run_sql(conn, "TRUNCATE TABLE stores RESTART IDENTITY CASCADE;")
+    run_sql(conn, "TRUNCATE TABLE employees RESTART IDENTITY CASCADE;")
+    run_sql(conn, "TRUNCATE TABLE products RESTART IDENTITY CASCADE;")
+    run_sql(conn, "TRUNCATE TABLE customer_child RESTART IDENTITY CASCADE;")
+    run_sql(conn, "TRUNCATE TABLE customers RESTART IDENTITY CASCADE;")
+    run_sql(conn, "TRUNCATE TABLE dates RESTART IDENTITY CASCADE;")
 
 
 def insert_dim(conn, table: str, df: pd.DataFrame, add_serial_key: bool = False):
@@ -367,7 +510,7 @@ def insert_dim(conn, table: str, df: pd.DataFrame, add_serial_key: bool = False)
     conn.commit()
 
 
-def insert_fact(conn, df: pd.DataFrame):
+def insert_orders(conn, df: pd.DataFrame):
     def pyify(x: Any) -> Any:
         if x is None:
             return None
@@ -390,15 +533,59 @@ def insert_fact(conn, df: pd.DataFrame):
     values = [tuple(pyify(x) for x in row) for row in df.itertuples(index=False, name=None)]
     with conn.cursor() as cur:
         execute_values(cur,
-                       f"INSERT INTO Sales_Fact ({colnames}) VALUES %s",
+                       f"INSERT INTO orders ({colnames}) VALUES %s",
+                       values,
+                       page_size=5000)
+    conn.commit()
+
+
+def insert_order_items(conn, df: pd.DataFrame):
+    def pyify(x: Any) -> Any:
+        if x is None:
+            return None
+        try:
+            if pd.isna(x):
+                return None
+        except Exception:
+            pass
+        if isinstance(x, (np.integer,)):
+            return int(x)
+        if isinstance(x, (np.floating,)):
+            return float(x)
+        if isinstance(x, (np.bool_,)):
+            return bool(x)
+        return x
+
+    cols = list(df.columns)
+    colnames = ','.join(cols)
+    values = [tuple(pyify(x) for x in row) for row in df.itertuples(index=False, name=None)]
+    with conn.cursor() as cur:
+        execute_values(cur,
+                       f"INSERT INTO order_items ({colnames}) VALUES %s",
                        values,
                        page_size=5000)
     conn.commit()
 
 
 def generate_and_load(cfg: Config, dbc: DbConfig):
+    # Detect export-only intent: all sizes/years/rows set to 0 and export folder specified
+    export_only = (
+        (cfg.customers == 0 and cfg.products == 0 and cfg.employees == 0 and cfg.stores == 0 and cfg.promotions == 0)
+        and (cfg.years == 0)
+        and (cfg.min_rows == 0 and cfg.max_rows == 0)
+        and (cfg.db_export_dir is not None)
+    )
+
     print("[1/6] Đảm bảo database tồn tại…")
     ensure_database(dbc)
+
+    if export_only:
+        # Do not touch schema or truncate; just export existing tables
+        print("[2/2] Chế độ chỉ xuất CSV từ database hiện có…")
+        export_tables_to_csv(dbc, cfg.db_export_dir)
+        print("Xuất CSV hoàn tất.")
+        return
+
     with get_conn(dbc) as conn:
         print("[2/6] Tạo schema…")
         create_schema(conn)
@@ -412,55 +599,118 @@ def generate_and_load(cfg: Config, dbc: DbConfig):
         cust_df = build_customer_dim(cfg.customers)
         prod_df = build_product_dim(cfg.products)
         promo_df = build_promotion_dim(cfg.promotions, date_df)
-        child_df = build_customer_users(cust_df)
+        child_df = build_customer_children(cust_df)
 
-        print("Chèn Date_Dim…")
-        insert_dim(conn, 'Date_Dim', date_df[['date_key','full_date','day','week','month','month_name_vi','quarter','year','is_weekend']])
-        print("Chèn Store_Dim…")
-        insert_dim(conn, 'Store_Dim', store_df[['store_id','ten_cua_hang','dia_chi','thanh_pho','tinh_thanh']])
-        print("Chèn Employee_Dim…")
-        insert_dim(conn, 'Employee_Dim', emp_df[['employee_id','ho_ten','chuc_danh','cua_hang_mac_dinh']])
-        print("Chèn Customer_Dim…")
-        insert_dim(conn, 'Customer_Dim', cust_df[['customer_id','ho_ten','gioi_tinh','ngay_sinh','so_dien_thoai','email','dia_chi','thanh_pho','tinh_thanh']])
+        print("Chèn dates…")
+        insert_dim(conn, 'dates', date_df[['date_id','full_date','day','week','month','month_name_vi','quarter','year','is_weekend']])
+        print("Chèn stores…")
+        df_store = store_df.rename(columns={'store_id':'id'})
+        insert_dim(conn, 'stores', df_store[['id','ten_cua_hang','dia_chi','thanh_pho','tinh_thanh']])
+        print("Chèn employees…")
+        df_emp = emp_df.rename(columns={'employee_id':'id'})
+        insert_dim(conn, 'employees', df_emp[['id','ho_ten','chuc_danh','cua_hang_mac_dinh']])
+        print("Chèn customers…")
+        df_cust = cust_df.rename(columns={'customer_id':'id'})
+        insert_dim(conn, 'customers', df_cust[['id','ho_ten','gioi_tinh','ngay_sinh','so_dien_thoai','email','dia_chi','thanh_pho','tinh_thanh','point','tier']])
         if not child_df.empty:
-            print("Chèn Customer_User…")
-            insert_dim(conn, 'Customer_User', child_df[['customer_key','gioi_tinh','ngay_sinh']])
-        print("Chèn Product_Dim…")
-        insert_dim(conn, 'Product_Dim', prod_df[['product_id','ten_san_pham','danh_muc','thuong_hieu','don_vi','gia_niem_yet']])
-        print("Chèn Promotion_Dim…")
-        insert_dim(conn, 'Promotion_Dim', promo_df[['promotion_id','ten_chuong_trinh','loai','gia_tri','start_date','end_date']])
+            print("Chèn customer_child…")
+            insert_dim(conn, 'customer_child', child_df[['customer_id','ho_ten','gioi_tinh','ngay_sinh']])
+        print("Chèn products…")
+        df_prod = prod_df.rename(columns={'product_id':'id'})
+        insert_dim(conn, 'products', df_prod[['id','ten_san_pham','danh_muc','thuong_hieu','don_vi','gia_niem_yet']])
+        print("Chèn promotions…")
+        df_promo = promo_df.rename(columns={'promotion_id':'id'})
+        insert_dim(conn, 'promotions', df_promo[['id','ten_chuong_trinh','loai','gia_tri','start_date','end_date']])
 
-        print("[5/6] Tạo dữ liệu Sales_Fact…")
-        sales_df = build_sales_fact(cfg.min_rows, cfg.max_rows, date_df, cust_df, prod_df, emp_df, store_df, promo_df)
+        print("[5/6] Tạo dữ liệu orders + order_items…")
+        orders_df, items_df = build_orders(cfg.min_rows, cfg.max_rows, date_df, cust_df, prod_df, emp_df, store_df, promo_df)
 
         # Optional CSV export
         if cfg.export_csv_dir:
             os.makedirs(cfg.export_csv_dir, exist_ok=True)
-            date_df.to_csv(os.path.join(cfg.export_csv_dir, 'Date_Dim.csv'), index=False)
-            store_df.to_csv(os.path.join(cfg.export_csv_dir, 'Store_Dim.csv'), index=False)
-            emp_df.to_csv(os.path.join(cfg.export_csv_dir, 'Employee_Dim.csv'), index=False)
-            cust_df.to_csv(os.path.join(cfg.export_csv_dir, 'Customer_Dim.csv'), index=False)
+            date_df.to_csv(os.path.join(cfg.export_csv_dir, 'dates.csv'), index=False)
+            df_store.to_csv(os.path.join(cfg.export_csv_dir, 'stores.csv'), index=False)
+            df_emp.to_csv(os.path.join(cfg.export_csv_dir, 'employees.csv'), index=False)
+            df_cust.to_csv(os.path.join(cfg.export_csv_dir, 'customers.csv'), index=False)
             if not child_df.empty:
-                child_df.to_csv(os.path.join(cfg.export_csv_dir, 'Customer_User.csv'), index=False)
-            prod_df.to_csv(os.path.join(cfg.export_csv_dir, 'Product_Dim.csv'), index=False)
-            promo_df.to_csv(os.path.join(cfg.export_csv_dir, 'Promotion_Dim.csv'), index=False)
-            sales_df.to_csv(os.path.join(cfg.export_csv_dir, 'Sales_Fact.csv'), index=False)
+                child_df.to_csv(os.path.join(cfg.export_csv_dir, 'customer_child.csv'), index=False)
+            df_prod.to_csv(os.path.join(cfg.export_csv_dir, 'products.csv'), index=False)
+            df_promo.to_csv(os.path.join(cfg.export_csv_dir, 'promotions.csv'), index=False)
+            orders_df.to_csv(os.path.join(cfg.export_csv_dir, 'orders.csv'), index=False)
+            items_df.to_csv(os.path.join(cfg.export_csv_dir, 'order_items.csv'), index=False)
 
-        print("[6/6] Chèn Sales_Fact…")
-        insert_fact(conn, sales_df[['date_key','customer_key','product_key','employee_key','store_key','promotion_key','so_luong','don_gia','chiet_khau','doanh_thu']])
+        print("[6/6] Chèn orders…")
+        insert_orders(conn, orders_df[['order_id','date_id','customer_id','employee_id','store_id','channel']])
+        print("Chèn order_items…")
+        insert_order_items(conn, items_df[['order_id','product_id','promotion_id','so_luong','don_gia','khuyen_mai','chiet_khau','doanh_thu']])
         print("Hoàn tất!")
 
-        # Build KPI summary after facts inserted
-        print("Tính toán KPI_Summary…")
-        kpi = sales_df.groupby(['date_key','store_key']).agg(
-            line_count=('so_luong','size'),
-            total_quantity=('so_luong','sum'),
-            total_discount=('chiet_khau','sum'),
-            total_revenue=('doanh_thu','sum')
+        # Build Monthly KPI targets per store (non-decreasing month over month)
+        # Join items with orders to get date_id and store_id
+        items_join = items_df.merge(orders_df[['order_id','date_id','store_id']], on='order_id', how='left')
+        items_join['year_month'] = items_join['date_id'].astype(str).str.slice(0, 6).astype(int)
+        monthly = items_join.groupby(['store_id','year_month']).agg(
+            doanh_thu=('doanh_thu','sum'),
+            so_luong_don_hang=('order_id','nunique'),
+            so_luong_san_pham=('so_luong','sum')
         ).reset_index()
-        kpi['avg_ticket'] = (kpi['total_revenue'] / kpi['line_count']).round(2)
+        # Enforce non-decreasing targets month-over-month per store
+        monthly.sort_values(['store_id','year_month'], inplace=True)
+        def monotonic_targets(df_store: pd.DataFrame) -> pd.DataFrame:
+            max_rev = 0.0
+            max_orders = 0
+            max_qty = 0
+            rows = []
+            for _, r in df_store.iterrows():
+                max_rev = max(max_rev, float(r['doanh_thu']))
+                max_orders = max(max_orders, int(r['so_luong_don_hang']))
+                max_qty = max(max_qty, int(r['so_luong_san_pham']))
+                rows.append({
+                    'store_id': r['store_id'],
+                    'year_month': int(r['year_month']),
+                    'doanh_thu': round(max_rev, 2),
+                    'so_luong_don_hang': max_orders,
+                    'so_luong_san_pham': max_qty,
+                })
+            return pd.DataFrame(rows)
+        target_df = (
+            monthly.groupby('store_id', group_keys=False)
+            .apply(monotonic_targets)
+            .reset_index(drop=True)
+        )
+        # Clean and insert
+        run_sql(conn, "TRUNCATE TABLE KPI_Target_Monthly RESTART IDENTITY CASCADE;")
+        insert_dim(conn, 'KPI_Target_Monthly', target_df[['store_id','year_month','doanh_thu','so_luong_don_hang','so_luong_san_pham']])
 
-        insert_dim(conn, 'KPI_Summary', kpi[['date_key','store_key','line_count','total_quantity','total_discount','total_revenue','avg_ticket']])
+        # Optional: export DB tables to CSV with UTF-8 BOM (friendly for Vietnamese in Excel)
+        if cfg.db_export_dir:
+            export_tables_to_csv(dbc, cfg.db_export_dir)
+
+
+def export_tables_to_csv(dbc: DbConfig, out_dir: str, tables: Optional[List[str]] = None):
+    """Export selected DB tables to CSV using PostgreSQL COPY.
+    Files are written with UTF-8 BOM (utf-8-sig) to support Vietnamese in Excel.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    if tables is None:
+        tables = [
+            'dates', 'customers', 'customer_child', 'products',
+            'employees', 'stores', 'promotions', 'orders',
+            'order_items', 'KPI_Target_Monthly'
+        ]
+    with get_conn(dbc) as conn:
+        with conn.cursor() as cur:
+            for t in tables:
+                target = os.path.join(out_dir, f"{t}.csv")
+                # Open with utf-8-sig to emit BOM; COPY writes text rows to this handle
+                with open(target, 'w', encoding='utf-8-sig', newline='') as f:
+                    sql = f"COPY {t} TO STDOUT WITH (FORMAT CSV, HEADER TRUE)"
+                    try:
+                        cur.copy_expert(sql, f)
+                        print(f"Đã xuất {t} -> {target}")
+                    except Exception as e:
+                        # Skip tables that might not exist or other copy errors
+                        print(f"Bỏ qua bảng {t}: {e}")
 
 
 if __name__ == '__main__':
