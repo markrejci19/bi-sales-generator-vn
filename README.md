@@ -5,6 +5,7 @@ Tạo dữ liệu mẫu (tiếng Việt) cho báo cáo Power BI theo mô hình s
 ## Bảng dữ liệu
 - Date_Dim (bao phủ >= 3 năm)
 - Customer_Dim (50–100 KH)
+  - Customer_User (0–5 người sử dụng/khách hàng: ngày sinh, giới tính)
 - Product_Dim (100–200 SP dành cho mẹ và bé)
 - Employee_Dim (20–50 NV)
 - Store_Dim (5–20 cửa hàng)

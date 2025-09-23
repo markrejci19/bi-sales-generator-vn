@@ -24,6 +24,15 @@ CREATE TABLE IF NOT EXISTS Customer_Dim (
     tinh_thanh VARCHAR(100)
 );
 
+-- Người sử dụng sản phẩm (con của khách hàng), mỗi khách hàng 0-5 người
+CREATE TABLE IF NOT EXISTS Customer_User (
+    user_key SERIAL PRIMARY KEY,
+    customer_key INT NOT NULL REFERENCES Customer_Dim(customer_key) ON DELETE CASCADE,
+    gioi_tinh VARCHAR(10) NOT NULL,
+    ngay_sinh DATE NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_customer_user_customer ON Customer_User(customer_key);
+
 CREATE TABLE IF NOT EXISTS Product_Dim (
     product_key SERIAL PRIMARY KEY,
     product_id VARCHAR(50) UNIQUE NOT NULL,

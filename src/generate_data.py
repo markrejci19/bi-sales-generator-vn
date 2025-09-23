@@ -159,6 +159,27 @@ def build_customer_dim(n: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_customer_users(cust_df: pd.DataFrame) -> pd.DataFrame:
+    """For each customer, create 0-5 product users (children) with gender and DOB."""
+    rows = []
+    for idx, _ in cust_df.iterrows():
+        customer_key = int(idx) + 1  # matches SERIAL order of inserts
+        count = random.randint(0, 5)
+        for _ in range(count):
+            gender = random.choice(["Nam", "Nữ"])
+            # Child age: 0-10 years old
+            years = random.randint(0, 10)
+            # ensure valid date within last 'years'
+            start = date.today() - relativedelta(years=years, days=random.randint(0, 364))
+            dob = start
+            rows.append({
+                'customer_key': customer_key,
+                'gioi_tinh': gender,
+                'ngay_sinh': dob
+            })
+    return pd.DataFrame(rows)
+
+
 def build_product_dim(n: int) -> pd.DataFrame:
     rows = []
     pid = 1
@@ -320,6 +341,7 @@ def truncate_tables(conn):
     run_sql(conn, "TRUNCATE TABLE Store_Dim RESTART IDENTITY CASCADE;")
     run_sql(conn, "TRUNCATE TABLE Employee_Dim RESTART IDENTITY CASCADE;")
     run_sql(conn, "TRUNCATE TABLE Product_Dim RESTART IDENTITY CASCADE;")
+    run_sql(conn, "TRUNCATE TABLE Customer_User RESTART IDENTITY CASCADE;")
     run_sql(conn, "TRUNCATE TABLE Customer_Dim RESTART IDENTITY CASCADE;")
     run_sql(conn, "TRUNCATE TABLE Date_Dim RESTART IDENTITY CASCADE;")
 
@@ -390,6 +412,7 @@ def generate_and_load(cfg: Config, dbc: DbConfig):
         cust_df = build_customer_dim(cfg.customers)
         prod_df = build_product_dim(cfg.products)
         promo_df = build_promotion_dim(cfg.promotions, date_df)
+        child_df = build_customer_users(cust_df)
 
         print("Chèn Date_Dim…")
         insert_dim(conn, 'Date_Dim', date_df[['date_key','full_date','day','week','month','month_name_vi','quarter','year','is_weekend']])
@@ -399,6 +422,9 @@ def generate_and_load(cfg: Config, dbc: DbConfig):
         insert_dim(conn, 'Employee_Dim', emp_df[['employee_id','ho_ten','chuc_danh','cua_hang_mac_dinh']])
         print("Chèn Customer_Dim…")
         insert_dim(conn, 'Customer_Dim', cust_df[['customer_id','ho_ten','gioi_tinh','ngay_sinh','so_dien_thoai','email','dia_chi','thanh_pho','tinh_thanh']])
+        if not child_df.empty:
+            print("Chèn Customer_User…")
+            insert_dim(conn, 'Customer_User', child_df[['customer_key','gioi_tinh','ngay_sinh']])
         print("Chèn Product_Dim…")
         insert_dim(conn, 'Product_Dim', prod_df[['product_id','ten_san_pham','danh_muc','thuong_hieu','don_vi','gia_niem_yet']])
         print("Chèn Promotion_Dim…")
@@ -414,6 +440,8 @@ def generate_and_load(cfg: Config, dbc: DbConfig):
             store_df.to_csv(os.path.join(cfg.export_csv_dir, 'Store_Dim.csv'), index=False)
             emp_df.to_csv(os.path.join(cfg.export_csv_dir, 'Employee_Dim.csv'), index=False)
             cust_df.to_csv(os.path.join(cfg.export_csv_dir, 'Customer_Dim.csv'), index=False)
+            if not child_df.empty:
+                child_df.to_csv(os.path.join(cfg.export_csv_dir, 'Customer_User.csv'), index=False)
             prod_df.to_csv(os.path.join(cfg.export_csv_dir, 'Product_Dim.csv'), index=False)
             promo_df.to_csv(os.path.join(cfg.export_csv_dir, 'Promotion_Dim.csv'), index=False)
             sales_df.to_csv(os.path.join(cfg.export_csv_dir, 'Sales_Fact.csv'), index=False)
