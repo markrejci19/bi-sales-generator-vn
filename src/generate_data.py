@@ -94,6 +94,15 @@ EMP_ROLES = ["Nhân viên bán hàng", "Thu ngân", "Quản lý cửa hàng", "T
 
 PROMO_TYPES = ["Percent", "Amount", "Bundle"]
 
+# Online marketplace stores (fixed IDs) used for Online orders
+ONLINE_PLATFORM_STORES = [
+    ("ONL-SHOPEE", "Shopee"),
+    ("ONL-LAZADA", "Lazada"),
+    ("ONL-TIKTOK", "TikTok"),
+    ("ONL-FACEBOOK", "Facebook"),
+    ("ONL-WEBAPP", "Web-App"),
+]
+
 @dataclass
 class Config:
     customers: int = 100
@@ -342,6 +351,7 @@ def build_employee_dim(n: int, stores: List[str]) -> pd.DataFrame:
 
 def build_store_dim(n: int) -> pd.DataFrame:
     rows = []
+    # Offline physical stores
     for i in range(n):
         city, province = random.choice(VN_CITIES)
         rows.append({
@@ -349,10 +359,21 @@ def build_store_dim(n: int) -> pd.DataFrame:
             'ten_cua_hang': f"Cửa hàng Mẹ&Bé {i+1}",
             'dia_chi': fake.street_address(),
             'thanh_pho': city,
-            'tinh_thanh': province
+            'tinh_thanh': province,
+            'store_type': 'Offline'
+        })
+    # Online platform stores
+    for sid, name in ONLINE_PLATFORM_STORES:
+        rows.append({
+            'store_id': sid,
+            'ten_cua_hang': name,
+            'dia_chi': None,
+            'thanh_pho': None,
+            'tinh_thanh': None,
+            'store_type': 'Online'
         })
     # Ensure DataFrame always has expected columns even when n == 0
-    return pd.DataFrame(rows, columns=['store_id','ten_cua_hang','dia_chi','thanh_pho','tinh_thanh'])
+    return pd.DataFrame(rows, columns=['store_id','ten_cua_hang','dia_chi','thanh_pho','tinh_thanh','store_type'])
 
 
 def build_promotion_dim(n: int, date_df: pd.DataFrame) -> pd.DataFrame:
@@ -422,6 +443,22 @@ def build_orders(
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     n_orders = random.randint(min_rows, max_rows)
     date_keys = date_df['date_id'].tolist()
+    # Partition stores
+    offline_df = store_df[store_df.get('store_type', 'Offline') == 'Offline'] if not store_df.empty else store_df
+    online_df = store_df[store_df.get('store_type', '') == 'Online'] if not store_df.empty else store_df
+    offline_ids = offline_df['store_id'].tolist() if not offline_df.empty else []
+    online_ids = online_df['store_id'].tolist() if not online_df.empty else []
+    # Build Pareto-like weights: top 30% stores take 70% of offline traffic
+    offline_probs = None
+    if len(offline_ids) > 0:
+        idxs = list(range(len(offline_ids)))
+        random.shuffle(idxs)
+        k = max(1, int(math.ceil(0.3 * len(offline_ids))))
+        top_set = set(idxs[:k])
+        rest = len(offline_ids) - k
+        w_top = 0.7 / k
+        w_rest = (0.3 / rest) if rest > 0 else 0.0
+        offline_probs = [w_top if i in top_set else w_rest for i in range(len(offline_ids))]
     # index promotions by date for simple matching
     promo_by_date: dict[int, list[pd.Series]] = {}
     for _, r in promo_df.iterrows():
@@ -434,15 +471,27 @@ def build_orders(
     for oid in range(1, n_orders + 1):
         dkey = random.choice(date_keys)
         cust = cust_df.sample(1).iloc[0] if not cust_df.empty else None
-        emp = emp_df.sample(1).iloc[0] if not emp_df.empty else None
-        store = store_df.sample(1).iloc[0] if not store_df.empty else None
         channel = 'Online' if random.random() < 0.35 else 'Offline'
+        # Select store per channel
+        if channel == 'Online' and online_ids:
+            store_id = random.choice(online_ids)
+            emp = None  # marketplace orders typically no in-store employee
+        else:
+            if offline_ids:
+                if offline_probs is not None:
+                    # weighted choice
+                    store_id = random.choices(offline_ids, weights=offline_probs, k=1)[0]
+                else:
+                    store_id = random.choice(offline_ids)
+            else:
+                store_id = None
+            emp = emp_df.sample(1).iloc[0] if not emp_df.empty else None
         headers.append({
             'order_id': oid,
             'date_id': dkey,
             'customer_id': (cust['customer_id'] if cust is not None else None),
             'employee_id': (emp['employee_id'] if emp is not None else None),
-            'store_id': (store['store_id'] if store is not None else None),
+            'store_id': store_id,
             'channel': channel,
         })
         # Items 1-5 unique products
@@ -595,7 +644,8 @@ def generate_and_load(cfg: Config, dbc: DbConfig):
         print("[4/6] Tạo dữ liệu dimension…")
         date_df = build_date_dim(cfg.years)
         store_df = build_store_dim(cfg.stores)
-        emp_df = build_employee_dim(cfg.employees, store_df['ten_cua_hang'].tolist())
+        offline_names = store_df.loc[store_df.get('store_type', 'Offline') == 'Offline', 'ten_cua_hang'].dropna().tolist()
+        emp_df = build_employee_dim(cfg.employees, offline_names)
         cust_df = build_customer_dim(cfg.customers)
         prod_df = build_product_dim(cfg.products)
         promo_df = build_promotion_dim(cfg.promotions, date_df)
@@ -605,6 +655,7 @@ def generate_and_load(cfg: Config, dbc: DbConfig):
         insert_dim(conn, 'dates', date_df[['date_id','full_date','day','week','month','month_name_vi','quarter','year','is_weekend']])
         print("Chèn stores…")
         df_store = store_df.rename(columns={'store_id':'id'})
+        # stores table doesn't have store_type column; we only insert supported columns
         insert_dim(conn, 'stores', df_store[['id','ten_cua_hang','dia_chi','thanh_pho','tinh_thanh']])
         print("Chèn employees…")
         df_emp = emp_df.rename(columns={'employee_id':'id'})
