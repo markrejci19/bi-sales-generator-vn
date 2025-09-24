@@ -28,6 +28,21 @@ VN_CITIES = [
     ("Buôn Ma Thuột", "Đắk Lắk"), ("Thủ Dầu Một", "Bình Dương"), ("Vũng Tàu", "Bà Rịa - Vũng Tàu"),
 ]
 
+# Simple region mapping by province/city
+MIEN_BAC = {"Hà Nội", "Hải Phòng", "Quảng Ninh", "Hải Dương", "Hưng Yên", "Bắc Ninh", "Nam Định", "Thái Bình", "Ninh Bình", "Vĩnh Phúc", "Phú Thọ"}
+MIEN_TRUNG = {"Đà Nẵng", "Thừa Thiên Huế", "Nghệ An", "Thanh Hóa", "Quảng Bình", "Quảng Trị", "Quảng Nam", "Khánh Hòa", "Bình Định", "Nha Trang"}
+MIEN_NAM = {"Hồ Chí Minh", "Đồng Nai", "Bình Dương", "Cần Thơ", "Bà Rịa - Vũng Tàu", "Bến Tre", "Long An", "Tây Ninh", "Vĩnh Long", "Tiền Giang", "An Giang"}
+
+def classify_mien(city: str | None, province: str | None) -> str:
+    p = (province or city or "").strip()
+    if p in MIEN_BAC:
+        return "Miền Bắc"
+    if p in MIEN_TRUNG:
+        return "Miền Trung"
+    if p in MIEN_NAM:
+        return "Miền Nam"
+    return "Miền Nam"  # default fallback
+
 PRODUCT_CATEGORIES = [
     ("Sữa bột", ["Dielac", "Friso", "Aptamil", "Nan", "Glico"]),
     ("Tã/bỉm", ["Pampers", "Moony", "Merries", "Huggies", "Bobby"]),
@@ -115,6 +130,9 @@ class Config:
     max_rows: int = 5000
     export_csv_dir: Optional[str] = None
     db_export_dir: Optional[str] = None  # export tables from DB to CSV with UTF-8 BOM
+    # Monthly active customers range per month
+    monthly_active_min: int = 700
+    monthly_active_max: int = 900
 
 @dataclass
 class DbConfig:
@@ -136,9 +154,24 @@ def load_config_from_env() -> Tuple[Config, DbConfig]:
         years=int(os.getenv('YEARS', 3)),
         min_rows=int(os.getenv('MIN_ROWS', 1000)),
         max_rows=int(os.getenv('MAX_ROWS', 5000)),
-    export_csv_dir=os.getenv('EXPORT_CSV_DIR'),
-    db_export_dir=os.getenv('DB_EXPORT_DIR')
+        # New env vars with backward compatibility
+        monthly_active_min=int(os.getenv('MONTHLY_ACTIVE_MIN', 700)),
+        monthly_active_max=int(os.getenv('MONTHLY_ACTIVE_MAX', 900)),
+        export_csv_dir=os.getenv('EXPORT_CSV_DIR'),
+        db_export_dir=os.getenv('DB_EXPORT_DIR')
     )
+    # Backward compatibility: if MONTHLY_ACTIVE_CUSTOMERS provided, pin min=max=value
+    legacy_mac = os.getenv('MONTHLY_ACTIVE_CUSTOMERS')
+    if legacy_mac is not None and legacy_mac != "":
+        try:
+            v = int(legacy_mac)
+            cfg.monthly_active_min = v
+            cfg.monthly_active_max = v
+        except ValueError:
+            pass
+    # Ensure min <= max
+    if cfg.monthly_active_min > cfg.monthly_active_max:
+        cfg.monthly_active_min, cfg.monthly_active_max = cfg.monthly_active_max, cfg.monthly_active_min
     dbc = DbConfig(
         host=os.getenv('PG_HOST', 'localhost'),
         port=int(os.getenv('PG_PORT', 5432)),
@@ -285,6 +318,50 @@ def build_product_dim(n: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_product_daily_costs(date_df: pd.DataFrame, prod_df: pd.DataFrame) -> pd.DataFrame:
+    """Generate daily input cost per product with smooth constraints approximated:
+    - Day-to-day change within ~±2% (<=3% hard limit enforced by DB trigger)
+    - Over any year, cost stays within roughly ±15% band (~<=20% enforced by trigger)
+    """
+    if prod_df.empty or date_df.empty:
+        return pd.DataFrame(columns=['product_id','date_id','cost'])
+    # Use only business days or all days? We'll use all days for simplicity
+    dates = date_df[['date_id','full_date']].sort_values('full_date').reset_index(drop=True)
+    out_rows: list[dict[str, Any]] = []
+    for prod in prod_df.itertuples(index=False):
+        base = float(prod.gia_niem_yet)
+        # Start baseline cost a bit below list price (e.g., 70%–90% of list)
+        cost0 = base * random.uniform(0.7, 0.9)
+        # Keep a slow-moving anchor to avoid exceeding 20% annually
+        anchor = cost0
+        anchor_reset_date = dates.loc[0, 'full_date']
+        prev_cost = None
+        for i, row in dates.iterrows():
+            dkey = int(row['date_id'])
+            cur_date = row['full_date']
+            # Every ~30-60 days, allow anchor to drift slightly (±3%)
+            if (cur_date - anchor_reset_date).days >= random.randint(30, 60):
+                anchor *= random.uniform(0.98, 1.02)
+                anchor_reset_date = cur_date
+            if prev_cost is None:
+                c = anchor
+            else:
+                # Small day-to-day walk within ±1.5% around anchor pull
+                step = random.uniform(-0.015, 0.015)
+                c = prev_cost * (1 + step)
+                # Pull back toward anchor a bit
+                c = (0.8 * c) + (0.2 * anchor)
+            # Soft bounds relative to anchor: keep within ~±15%
+            lo = anchor * 0.85
+            hi = anchor * 1.15
+            c = max(lo, min(hi, c))
+            # Ensure non-zero and reasonable minimum
+            c = max(1000.0, c)
+            out_rows.append({'product_id': prod.product_id, 'date_id': dkey, 'cost': round(float(c), 2)})
+            prev_cost = c
+    return pd.DataFrame(out_rows)
+
+
 def refresh_products_only(dbc: DbConfig):
     """Regenerate products attributes in place (update only) to keep FKs intact."""
     with get_conn(dbc) as conn:
@@ -336,6 +413,85 @@ def refresh_products_only(dbc: DbConfig):
         print(f"Đã cập nhật lại {len(ids)} sản phẩm trong products (chỉ update).")
 
 
+def refresh_stores_only(dbc: DbConfig):
+    """Regenerate store attributes in place while preserving existing store IDs and FKs.
+    - Updates offline stores (ids like 'STO-###') with new name/address/city/province/mien.
+    - Ensures online platform stores exist and are set to mien='Online'.
+    - Does not touch other tables.
+    """
+    online_id_set = {sid for sid, _ in ONLINE_PLATFORM_STORES}
+    with get_conn(dbc) as conn:
+        with conn.cursor() as cur:
+            # Ensure column exists
+            cur.execute("ALTER TABLE IF EXISTS stores ADD COLUMN IF NOT EXISTS mien VARCHAR(20)")
+            # Load current store ids
+            cur.execute("SELECT id FROM stores ORDER BY id")
+            all_ids = [r[0] for r in cur.fetchall()]
+        # Partition
+        offline_ids = sorted([sid for sid in all_ids if sid and sid.startswith('STO-')])
+        # Build fresh offline rows
+        new_df = build_store_dim(len(offline_ids))
+        new_offline = new_df[new_df['store_type'] == 'Offline'].copy()
+        # Map generated rows to existing ids in order
+        new_offline.sort_index(inplace=True)
+        # If counts mismatch, trim or pad (pad from generator)
+        if len(new_offline) > len(offline_ids):
+            new_offline = new_offline.iloc[:len(offline_ids)].copy()
+        elif len(new_offline) < len(offline_ids):
+            # generate extra to match
+            extra_needed = len(offline_ids) - len(new_offline)
+            extra_df = build_store_dim(extra_needed)
+            extra_off = extra_df[extra_df['store_type'] == 'Offline'].copy()
+            new_offline = pd.concat([new_offline, extra_off.iloc[:extra_needed]], ignore_index=True)
+        new_offline['store_id'] = offline_ids
+        # Prepare updates
+        up_rows = [
+            (
+                row.ten_cua_hang,
+                row.dia_chi,
+                row.thanh_pho,
+                row.tinh_thanh,
+                row.mien,
+                row.store_id,
+            )
+            for row in new_offline.itertuples(index=False)
+        ]
+        with conn.cursor() as cur:
+            # Update offline stores
+            cur.executemany(
+                """
+                UPDATE stores
+                SET ten_cua_hang=%s,
+                    dia_chi=%s,
+                    thanh_pho=%s,
+                    tinh_thanh=%s,
+                    mien=%s
+                WHERE id=%s
+                """,
+                up_rows,
+            )
+            # Upsert online platform stores
+            platform_rows = [
+                (sid, name, None, None, None, 'Online')
+                for sid, name in ONLINE_PLATFORM_STORES
+            ]
+            cur.executemany(
+                """
+                INSERT INTO stores (id, ten_cua_hang, dia_chi, thanh_pho, tinh_thanh, mien)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (id) DO UPDATE SET
+                    ten_cua_hang=EXCLUDED.ten_cua_hang,
+                    dia_chi=EXCLUDED.dia_chi,
+                    thanh_pho=EXCLUDED.thanh_pho,
+                    tinh_thanh=EXCLUDED.tinh_thanh,
+                    mien=EXCLUDED.mien
+                """,
+                platform_rows,
+            )
+        conn.commit()
+    print(f"Đã cập nhật {len(offline_ids)} cửa hàng offline và đồng bộ cửa hàng online (chỉ update stores).")
+
+
 def build_employee_dim(n: int, stores: List[str]) -> pd.DataFrame:
     rows = []
     for i in range(n):
@@ -360,6 +516,7 @@ def build_store_dim(n: int) -> pd.DataFrame:
             'dia_chi': fake.street_address(),
             'thanh_pho': city,
             'tinh_thanh': province,
+            'mien': classify_mien(city, province),
             'store_type': 'Offline'
         })
     # Online platform stores
@@ -370,10 +527,11 @@ def build_store_dim(n: int) -> pd.DataFrame:
             'dia_chi': None,
             'thanh_pho': None,
             'tinh_thanh': None,
+            'mien': 'Online',
             'store_type': 'Online'
         })
     # Ensure DataFrame always has expected columns even when n == 0
-    return pd.DataFrame(rows, columns=['store_id','ten_cua_hang','dia_chi','thanh_pho','tinh_thanh','store_type'])
+    return pd.DataFrame(rows, columns=['store_id','ten_cua_hang','dia_chi','thanh_pho','tinh_thanh','mien','store_type'])
 
 
 def build_promotion_dim(n: int, date_df: pd.DataFrame) -> pd.DataFrame:
@@ -439,10 +597,40 @@ def build_orders(
     prod_df: pd.DataFrame,
     emp_df: pd.DataFrame,
     store_df: pd.DataFrame,
-    promo_df: pd.DataFrame
+    promo_df: pd.DataFrame,
+    monthly_active_min: int = 700,
+    monthly_active_max: int = 900,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     n_orders = random.randint(min_rows, max_rows)
     date_keys = date_df['date_id'].tolist()
+    # Map date_id -> year_month
+    date_df = date_df.copy()
+    date_df['year_month'] = date_df['date_id'].astype(str).str.slice(0, 6).astype(int)
+    dkey_to_month = dict(zip(date_df['date_id'], date_df['year_month']))
+    months = sorted(date_df['year_month'].unique().tolist())
+    # Build monthly active customer sets and cycling indices
+    all_cust_ids = cust_df['customer_id'].tolist() if not cust_df.empty else []
+    month_active_map: dict[int, list[str]] = {}
+    month_cycle_idx: dict[int, int] = {}
+    for m in months:
+        if all_cust_ids:
+            # choose active set size in [min, max]
+            try:
+                lo = int(monthly_active_min)
+                hi = int(monthly_active_max)
+            except Exception:
+                lo, hi = 700, 900
+            if lo > hi:
+                lo, hi = hi, lo
+            k = random.randint(lo, hi)
+            k = min(k, len(all_cust_ids))
+            act = random.sample(all_cust_ids, k)
+            random.shuffle(act)
+            month_active_map[m] = act
+            month_cycle_idx[m] = 0
+        else:
+            month_active_map[m] = []
+            month_cycle_idx[m] = 0
     # Partition stores
     offline_df = store_df[store_df.get('store_type', 'Offline') == 'Offline'] if not store_df.empty else store_df
     online_df = store_df[store_df.get('store_type', '') == 'Online'] if not store_df.empty else store_df
@@ -470,7 +658,7 @@ def build_orders(
     items = []
     for oid in range(1, n_orders + 1):
         dkey = random.choice(date_keys)
-        cust = cust_df.sample(1).iloc[0] if not cust_df.empty else None
+        # Pick channel first
         channel = 'Online' if random.random() < 0.35 else 'Offline'
         # Select store per channel
         if channel == 'Online' and online_ids:
@@ -486,6 +674,15 @@ def build_orders(
             else:
                 store_id = None
             emp = emp_df.sample(1).iloc[0] if not emp_df.empty else None
+        # Choose customer based on month activity
+        month = dkey_to_month.get(dkey)
+        cust = None
+        if month is not None and month_active_map.get(month):
+            idx = month_cycle_idx[month]
+            cust_id = month_active_map[month][idx]
+            month_cycle_idx[month] = (idx + 1) % len(month_active_map[month])
+            # Construct a minimal Series-like for consistency
+            cust = pd.Series({'customer_id': cust_id})
         headers.append({
             'order_id': oid,
             'date_id': dkey,
@@ -655,8 +852,8 @@ def generate_and_load(cfg: Config, dbc: DbConfig):
         insert_dim(conn, 'dates', date_df[['date_id','full_date','day','week','month','month_name_vi','quarter','year','is_weekend']])
         print("Chèn stores…")
         df_store = store_df.rename(columns={'store_id':'id'})
-        # stores table doesn't have store_type column; we only insert supported columns
-        insert_dim(conn, 'stores', df_store[['id','ten_cua_hang','dia_chi','thanh_pho','tinh_thanh']])
+        # stores table doesn't have store_type column; insert supported columns including 'mien'
+        insert_dim(conn, 'stores', df_store[['id','ten_cua_hang','dia_chi','thanh_pho','tinh_thanh','mien']])
         print("Chèn employees…")
         df_emp = emp_df.rename(columns={'employee_id':'id'})
         insert_dim(conn, 'employees', df_emp[['id','ho_ten','chuc_danh','cua_hang_mac_dinh']])
@@ -669,12 +866,28 @@ def generate_and_load(cfg: Config, dbc: DbConfig):
         print("Chèn products…")
         df_prod = prod_df.rename(columns={'product_id':'id'})
         insert_dim(conn, 'products', df_prod[['id','ten_san_pham','danh_muc','thuong_hieu','don_vi','gia_niem_yet']])
+        # Build and insert product daily costs
+        print("Chèn product_daily_costs…")
+        pdc_df = build_product_daily_costs(date_df, prod_df)
+        if not pdc_df.empty:
+            insert_dim(conn, 'product_daily_costs', pdc_df[['product_id','date_id','cost']])
         print("Chèn promotions…")
         df_promo = promo_df.rename(columns={'promotion_id':'id'})
         insert_dim(conn, 'promotions', df_promo[['id','ten_chuong_trinh','loai','gia_tri','start_date','end_date']])
 
         print("[5/6] Tạo dữ liệu orders + order_items…")
-        orders_df, items_df = build_orders(cfg.min_rows, cfg.max_rows, date_df, cust_df, prod_df, emp_df, store_df, promo_df)
+        orders_df, items_df = build_orders(
+            cfg.min_rows,
+            cfg.max_rows,
+            date_df,
+            cust_df,
+            prod_df,
+            emp_df,
+            store_df,
+            promo_df,
+            monthly_active_min=cfg.monthly_active_min,
+            monthly_active_max=cfg.monthly_active_max,
+        )
 
         # Optional CSV export
         if cfg.export_csv_dir:
@@ -686,6 +899,8 @@ def generate_and_load(cfg: Config, dbc: DbConfig):
             if not child_df.empty:
                 child_df.to_csv(os.path.join(cfg.export_csv_dir, 'customer_child.csv'), index=False)
             df_prod.to_csv(os.path.join(cfg.export_csv_dir, 'products.csv'), index=False)
+            if not pdc_df.empty:
+                pdc_df.to_csv(os.path.join(cfg.export_csv_dir, 'product_daily_costs.csv'), index=False)
             df_promo.to_csv(os.path.join(cfg.export_csv_dir, 'promotions.csv'), index=False)
             orders_df.to_csv(os.path.join(cfg.export_csv_dir, 'orders.csv'), index=False)
             items_df.to_csv(os.path.join(cfg.export_csv_dir, 'order_items.csv'), index=False)
@@ -746,7 +961,7 @@ def export_tables_to_csv(dbc: DbConfig, out_dir: str, tables: Optional[List[str]
     if tables is None:
         tables = [
             'dates', 'customers', 'customer_child', 'products',
-            'employees', 'stores', 'promotions', 'orders',
+            'employees', 'stores', 'promotions', 'product_daily_costs', 'orders',
             'order_items', 'KPI_Target_Monthly'
         ]
     with get_conn(dbc) as conn:
@@ -767,3 +982,36 @@ def export_tables_to_csv(dbc: DbConfig, out_dir: str, tables: Optional[List[str]
 if __name__ == '__main__':
     cfg, dbc = load_config_from_env()
     generate_and_load(cfg, dbc)
+
+
+# --- Utilities for one-off migrations (not executed on import) ---
+def migrate_add_mien_to_stores(dbc: DbConfig):
+    """Add 'mien' column to stores and backfill values without touching other tables."""
+    online_ids = [sid for sid, _ in ONLINE_PLATFORM_STORES]
+    with get_conn(dbc) as conn:
+        with conn.cursor() as cur:
+            # Add column if missing
+            cur.execute("ALTER TABLE IF EXISTS stores ADD COLUMN IF NOT EXISTS mien VARCHAR(20)")
+            # Online stores -> 'Online'
+            if online_ids:
+                ids_tuple = tuple(online_ids)
+                if len(ids_tuple) == 1:
+                    cur.execute("UPDATE stores SET mien='Online' WHERE id = %s", (ids_tuple[0],))
+                else:
+                    cur.execute(f"UPDATE stores SET mien='Online' WHERE id IN %s", (ids_tuple,))
+            # Region backfill for others where mien IS NULL
+            def update_region(names: set, label: str):
+                if not names:
+                    return
+                vals = tuple(names)
+                if len(vals) == 1:
+                    cur.execute("UPDATE stores SET mien=%s WHERE mien IS NULL AND (tinh_thanh=%s OR thanh_pho=%s)", (label, vals[0], vals[0]))
+                else:
+                    cur.execute("UPDATE stores SET mien=%s WHERE mien IS NULL AND (tinh_thanh IN %s OR thanh_pho IN %s)", (label, vals, vals))
+            update_region(MIEN_BAC, "Miền Bắc")
+            update_region(MIEN_TRUNG, "Miền Trung")
+            update_region(MIEN_NAM, "Miền Nam")
+            # Default fallback
+            cur.execute("UPDATE stores SET mien='Miền Nam' WHERE mien IS NULL")
+        conn.commit()
+    print("Đã cập nhật cột 'mien' cho bảng stores mà không ảnh hưởng các bảng khác.")

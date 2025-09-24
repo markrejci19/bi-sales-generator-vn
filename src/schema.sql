@@ -3,6 +3,7 @@
 
 -- Drop existing tables to allow PK/FK changes safely
 DROP TABLE IF EXISTS KPI_Target_Monthly;
+DROP TABLE IF EXISTS product_daily_costs;
 DROP TABLE IF EXISTS order_items;
 DROP TABLE IF EXISTS orders;
 DROP TABLE IF EXISTS customer_child;
@@ -69,7 +70,8 @@ CREATE TABLE IF NOT EXISTS stores (
     ten_cua_hang VARCHAR(120) NOT NULL,
     dia_chi VARCHAR(255),
     thanh_pho VARCHAR(100),
-    tinh_thanh VARCHAR(100)
+    tinh_thanh VARCHAR(100),
+    mien VARCHAR(20)
 );
 
 CREATE TABLE IF NOT EXISTS promotions (
@@ -140,3 +142,86 @@ CREATE TABLE IF NOT EXISTS KPI_Target_Monthly (
     CONSTRAINT uk_store_month UNIQUE(store_id, year_month)
 );
 CREATE INDEX IF NOT EXISTS idx_kpi_target_month ON KPI_Target_Monthly(year_month);
+
+-- Daily product input cost table with smoothness constraints
+CREATE TABLE IF NOT EXISTS product_daily_costs (
+    product_id VARCHAR(50) NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    date_id INT NOT NULL REFERENCES dates(date_id) ON DELETE CASCADE,
+    cost NUMERIC(12,2) NOT NULL,
+    CONSTRAINT pk_product_daily_costs PRIMARY KEY (product_id, date_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pdc_product ON product_daily_costs(product_id);
+CREATE INDEX IF NOT EXISTS idx_pdc_date ON product_daily_costs(date_id);
+
+-- Enforce: day-to-day change within 3%, and any 365-day window range within 20%
+CREATE OR REPLACE FUNCTION enforce_product_cost_smoothness()
+RETURNS trigger AS $$
+DECLARE
+    v_prev_date_id INT;
+    v_next_date_id INT;
+    v_prev_cost NUMERIC(12,2);
+    v_next_cost NUMERIC(12,2);
+    v_cur_date DATE;
+    v_window_start DATE;
+    v_window_end DATE;
+    v_min_cost NUMERIC(12,2);
+    v_max_cost NUMERIC(12,2);
+BEGIN
+    -- Resolve current date
+    SELECT full_date INTO v_cur_date FROM dates WHERE date_id = NEW.date_id;
+    IF v_cur_date IS NULL THEN
+        RAISE EXCEPTION 'date_id % not found in dates', NEW.date_id;
+    END IF;
+
+    -- Check previous day (+-3%)
+    SELECT d2.date_id INTO v_prev_date_id
+    FROM dates d1
+    JOIN dates d2 ON d2.full_date = d1.full_date - INTERVAL '1 day'
+    WHERE d1.date_id = NEW.date_id;
+    IF v_prev_date_id IS NOT NULL THEN
+        SELECT cost INTO v_prev_cost FROM product_daily_costs WHERE product_id = NEW.product_id AND date_id = v_prev_date_id;
+        IF v_prev_cost IS NOT NULL THEN
+            IF NEW.cost > v_prev_cost * 1.03 OR NEW.cost < v_prev_cost * 0.97 THEN
+                RAISE EXCEPTION 'Daily cost change exceeds 3%% for product %, date_id % (prev % vs new %)', NEW.product_id, NEW.date_id, v_prev_cost, NEW.cost;
+            END IF;
+        END IF;
+    END IF;
+
+    -- Also check next day if it exists (to cover updates affecting forward neighbor)
+    SELECT d2.date_id INTO v_next_date_id
+    FROM dates d1
+    JOIN dates d2 ON d2.full_date = d1.full_date + INTERVAL '1 day'
+    WHERE d1.date_id = NEW.date_id;
+    IF v_next_date_id IS NOT NULL THEN
+        SELECT cost INTO v_next_cost FROM product_daily_costs WHERE product_id = NEW.product_id AND date_id = v_next_date_id;
+        IF v_next_cost IS NOT NULL THEN
+            IF v_next_cost > NEW.cost * 1.03 OR v_next_cost < NEW.cost * 0.97 THEN
+                RAISE EXCEPTION 'Daily cost change exceeds 3%% for product %, next day % vs new %', NEW.product_id, v_next_cost, NEW.cost;
+            END IF;
+        END IF;
+    END IF;
+
+    -- 365-day rolling window: ensure max/min <= 1.2
+    v_window_start := v_cur_date - INTERVAL '365 days';
+    v_window_end := v_cur_date; -- backward-looking window
+    SELECT MIN(cost), MAX(cost)
+      INTO v_min_cost, v_max_cost
+      FROM product_daily_costs pdc
+      JOIN dates d ON d.date_id = pdc.date_id
+     WHERE pdc.product_id = NEW.product_id
+       AND d.full_date BETWEEN v_window_start AND v_window_end;
+    -- Consider NEW.cost in the window
+    IF v_min_cost IS NULL OR NEW.cost < v_min_cost THEN v_min_cost := NEW.cost; END IF;
+    IF v_max_cost IS NULL OR NEW.cost > v_max_cost THEN v_max_cost := NEW.cost; END IF;
+    IF v_min_cost > 0 AND (v_max_cost / v_min_cost) > 1.2 THEN
+        RAISE EXCEPTION 'Cost range exceeds 20%% within 365 days for product % on date_id % (min %, max %)', NEW.product_id, NEW.date_id, v_min_cost, v_max_cost;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_product_cost_smoothness ON product_daily_costs;
+CREATE TRIGGER trg_product_cost_smoothness
+BEFORE INSERT OR UPDATE ON product_daily_costs
+FOR EACH ROW EXECUTE FUNCTION enforce_product_cost_smoothness();

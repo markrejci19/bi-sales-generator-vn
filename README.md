@@ -50,11 +50,20 @@ Mặc định script sẽ dùng kết nối: host=localhost, db=bi_courses, user
 --min-rows (>=500000)
 --max-rows (<=600000)
 --export-csv <thư_mục>
+--monthly-active-min <int>   # số KH hoạt động tối thiểu mỗi tháng (mặc định 700)
+--monthly-active-max <int>   # số KH hoạt động tối đa mỗi tháng (mặc định 900)
+--monthly-active-customers <int>  # (cũ) cố định một giá trị cho mọi tháng
 ```
 
 Ví dụ tạo dữ liệu nhỏ để thử nhanh:
 ```powershell
 python .\src\main.py --customers 60 --products 120 --employees 25 --stores 8 --promotions 12 --years 3 --min-rows 1200 --max-rows 2400
+```
+
+Ví dụ ràng buộc số khách mua theo tháng dao động 700–900 (mặc định đã dùng khoảng này, có thể điều chỉnh bằng cờ dưới):
+
+```powershell
+python .\src\main.py --monthly-active-min 700 --monthly-active-max 900
 ```
 
 ## Ghi chú

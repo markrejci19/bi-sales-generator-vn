@@ -15,10 +15,16 @@ def parse_args():
     p.add_argument('--years', type=int)
     p.add_argument('--min-rows', type=int)
     p.add_argument('--max-rows', type=int)
+    # Backward compatibility single value
+    p.add_argument('--monthly-active-customers', type=int, help='[Deprecated] Fixed number of active customers per month')
+    # New range-based controls
+    p.add_argument('--monthly-active-min', type=int, help='Minimum active customers per month (default 700)')
+    p.add_argument('--monthly-active-max', type=int, help='Maximum active customers per month (default 900)')
     p.add_argument('--export-csv', type=str, help='Folder to export CSVs in addition to DB insert')
     p.add_argument('--export-db-csv', type=str, help='Export tables from DB to CSV after load (UTF-8 BOM)')
     p.add_argument('--export-only', action='store_true', help='Only export tables from DB to CSV and exit (no generation)')
     p.add_argument('--refresh-products-only', action='store_true', help='Only regenerate Product_Dim attributes (update in place)')
+    p.add_argument('--refresh-stores-only', action='store_true', help='Only regenerate Stores attributes (update in place)')
 
     p.add_argument('--pg-host', type=str)
     p.add_argument('--pg-port', type=int)
@@ -46,6 +52,15 @@ def main():
     if args.years is not None: cfg.years = args.years
     if args.min_rows is not None: cfg.min_rows = args.min_rows
     if args.max_rows is not None: cfg.max_rows = args.max_rows
+    # Map monthly active customer flags
+    if args.monthly_active_min is not None:
+        cfg.monthly_active_min = args.monthly_active_min
+    if args.monthly_active_max is not None:
+        cfg.monthly_active_max = args.monthly_active_max
+    if args.monthly_active_customers is not None:
+        # pin min=max=value for backward compatibility
+        cfg.monthly_active_min = args.monthly_active_customers
+        cfg.monthly_active_max = args.monthly_active_customers
     if args.export_csv is not None: cfg.export_csv_dir = args.export_csv
     if args.export_db_csv is not None: cfg.db_export_dir = args.export_db_csv
 
@@ -70,6 +85,13 @@ def main():
     if args.refresh_products_only:
         from generate_data import refresh_products_only
         refresh_products_only(dbc)
+    elif args.refresh_stores_only:
+        from generate_data import refresh_stores_only
+        refresh_stores_only(dbc)
+    elif getattr(args, 'refresh_orders_only', False):
+        from generate_data import get_conn, build_date_dim, build_orders, insert_orders, insert_order_items
+        # Not wired via arg yet; leaving placeholder for future use
+        generate_and_load(cfg, dbc)
     else:
         generate_and_load(cfg, dbc)
 
